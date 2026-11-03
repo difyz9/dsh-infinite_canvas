@@ -943,6 +943,13 @@ function revealCanvasInRight() {
       'modeEdits': '参考图编辑 /images/edits（多参考图上传）',
       'modeCompshare': '优云智算任务式 /image/v1/tasks（Qwen-Image，参考图登记 + 提示词优化）',
       'modeSanbao': '三宝图片任务 /openapi/v1/images（异步任务，任务 id 可回查；baseUrl 命中 sanbaobeauty.com 自动生效）',
+      'modeKie': 'KIE 图片任务（目录 + schema）',
+      'kieLoadModels': '加载 KIE 模型',
+      'kieLoading': '正在加载…',
+      'kiePickModel': '选择目录中的模型',
+      'kieNoModels': '目录中没有匹配的模型',
+      'kieMaskUnsupported': 'KIE 当前不支持蒙版重绘，请选择支持 images/edits 的模型',
+      'kieExtraHint': 'KIE：扩展参数填 {"input":{...}}；必填字段、枚举以模型 schema 为准。本地图片会上传至 KIE 临时文件服务。',
       'catMismatch': '提示：资产分类为「{a}」，端口期望「{b}」，已保留连接',
       'nStoryboard': '分镜表',
       'nScript': '剧本',
@@ -1890,6 +1897,13 @@ function revealCanvasInRight() {
       'modeEdits': 'image edit /images/edits (multi-reference upload)',
       'modeCompshare': 'Compshare task /image/v1/tasks (Qwen-Image, reference upload)',
       'modeSanbao': 'Sanbao image task /openapi/v1/images (async task with queryable task id; auto-enabled when baseUrl hits sanbaobeauty.com)',
+      'modeKie': 'KIE image tasks (catalog + schema)',
+      'kieLoadModels': 'Load KIE models',
+      'kieLoading': 'Loading…',
+      'kiePickModel': 'Select a model from the catalog',
+      'kieNoModels': 'No matching models in the catalog',
+      'kieMaskUnsupported': 'KIE mask inpainting is not supported; select an images/edits model',
+      'kieExtraHint': 'KIE: use {"input":{...}} for extra parameters; required fields and enums follow the model schema. Local images are uploaded to KIE temporary storage.',
       'catMismatch': 'Note: asset category is "{a}", port expects "{b}". Connected anyway.',
       'nStoryboard': 'Storyboard',
       'nScript': 'Script',
@@ -5777,10 +5791,13 @@ function queueThumb(assetId) {
       let extraSrc = String(s.extra || '');
       if (nodeExtra) {
         try {
-          extraSrc = JSON.stringify({ ...(extraSrc.trim() ? JSON.parse(extraSrc) : {}), ...JSON.parse(nodeExtra) });
+          const providerExtra = parseExtraParams(extraSrc) || {};
+          const localExtra = parseExtraParams(nodeExtra);
+          extraSrc = JSON.stringify(s.mode === 'kie' ? mergeKieExtra(providerExtra, localExtra) : { ...providerExtra, ...localExtra });
         } catch (e) { throw new Error('节点扩展参数需为 JSON 对象：' + ((e && e.message) || e)); }
       }
       const extra = parseExtraParams(extraSrc); // 厂商专属参数（留空不发送）
+      if (s.mode === 'kie') return await kieMediaTask(prompt, refs, { ...s, extra: extraSrc }, opts || {}, 'image');
       // 优云智算（compshare）任务式：Qwen-Image 异步任务（提交 → 轮询 → output_url 下载）
       if (s.mode === 'compshare') return await compshareImageTask(prompt, refs, { ...s, extra: extraSrc }, opts);
       // 协议自动路由：优云智算的图片 API 只有任务式（/image/v1/tasks）——误配成通用模式
@@ -6385,6 +6402,7 @@ function queueThumb(assetId) {
     // 端点路径/鉴权方式/参数格式/轮询语义全部由代码按各家官方 API 适配。
     // ============================================================
     const VIDEO_VENDORS = {
+      kie:       { label: 'KIE · Image to Video', base: 'https://api.kie.ai', keyPh: 'KIE API Key', note: '从目录选择图生视频模型；按 schema 构造 input，本地首帧上传到 KIE。扩展参数使用 {"input":{...}}；仅支持统一 createTask 任务接口。' },
       openai:    { label: 'OpenAI 兼容格式（通用/中转站）', note: '适配 /v1/video/generations、Seedance content[]、/v1/videos 三段自动降级' },
       seedance:  { label: '火山方舟 · Seedance（豆包视频）', base: 'https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks', keyPh: 'ARK API Key', note: 'Base URL 填方舟提交端点或 /api/v3 均可；模型 id 如 doubao-seedance-2-0-260128' },
       kling:     { label: '快手可灵 Kling', base: 'https://api.klingai.com', keyPh: 'AK:SK（冒号分隔）', note: 'Key 填 AK:SK，代码自动签 JWT；国际站把 Base URL 改为 api-singapore.klingai.com；时长按官方 5/10s 取整' },
@@ -6405,6 +6423,238 @@ function queueThumb(assetId) {
       let b = String(raw || fallback || '').trim().replace(/\/+$/, '');
       b = b.replace(/\/(api\/)?v1$/i, '');
       return b;
+    }
+    function kieBase(s) {
+      return vendorBase(String(s.baseUrl || s.url || 'https://api.kie.ai').replace(/\/api\/v1\/jobs\/createTask\/?$/i, ''));
+    }
+    function mergeKieExtra(base, extra) {
+      for (const value of [base, extra]) {
+        if (Object.hasOwn(value, 'input') && (!value.input || typeof value.input !== 'object' || Array.isArray(value.input))) throw new Error('KIE: extra input must be an object');
+      }
+      return { ...base, ...extra, ...(base.input || extra.input ? { input: { ...base.input, ...extra.input } } : {}) };
+    }
+    async function kieRequest(s, path, body) {
+      if (!String(s.apiKey || '').trim()) throw new Error('KIE: API Key is required');
+      const url = /^https:\/\//.test(path) ? path : kieBase(s) + path;
+      const r = await fetchViaProxy(url, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + String(s.apiKey).trim() },
+        body, label: 'KIE', timeoutMs: 120000,
+      });
+      if (!r.ok) {
+        const error = new Error('KIE HTTP ' + r.status + ': ' + r.text.slice(0, 300));
+        error.status = r.status;
+        throw error;
+      }
+      let j;
+      try { j = JSON.parse(r.text); } catch { throw new Error('KIE: invalid JSON response'); }
+      if (j.code !== 200 || j.success === false) {
+        const error = new Error('KIE ' + j.code + ': ' + (j.msg || 'Request failed'));
+        error.status = j.code;
+        throw error;
+      }
+      return j.data;
+    }
+    // Catalog/schema share a 1 request/second account limit, including concurrent nodes.
+    let kieDiscoveryQueue = Promise.resolve();
+    let kieDiscoveryAt = 0;
+    function kieDiscover(s, path) {
+      const run = kieDiscoveryQueue.then(async () => {
+        await sleep(Math.max(0, kieDiscoveryAt + 1100 - Date.now()));
+        kieDiscoveryAt = Date.now();
+        return await kieRequest(s, path);
+      });
+      kieDiscoveryQueue = run.then(() => undefined, () => undefined);
+      return run;
+    }
+    async function kieCatalog(s, kind) {
+      const taskType = kind === 'video' ? 'Image to Video' : 'Text to Image';
+      const data = await kieDiscover(s, '/api/v1/models?taskType=' + encodeURIComponent(taskType));
+      if (!data || !Array.isArray(data.models)) throw new Error('KIE: catalog did not return models');
+      return data.models.filter((m) => m && typeof m.model === 'string');
+    }
+    function kieSchema(doc, schema, depth = 0) {
+      if (depth > 40) throw new Error('KIE: recursive/invalid schema');
+      if (!schema || typeof schema !== 'object') return schema;
+      if (schema.$ref) {
+        if (!schema.$ref.startsWith('#/')) throw new Error('KIE: external schema references are not supported');
+        let target = doc;
+        for (const part of schema.$ref.slice(2).split('/')) target = target && target[decodeURIComponent(part).replace(/~1/g, '/').replace(/~0/g, '~')];
+        if (!target) throw new Error('KIE: unresolved schema ' + schema.$ref);
+        const { $ref, ...rest } = schema;
+        return kieSchema(doc, { ...kieSchema(doc, target, depth + 1), ...rest }, depth + 1);
+      }
+      let out = { ...schema };
+      for (const item of schema.allOf || []) {
+        const part = kieSchema(doc, item, depth + 1);
+        out = { ...out, ...part, properties: { ...out.properties, ...part.properties }, required: [...new Set([...(out.required || []), ...(part.required || [])])] };
+      }
+      delete out.allOf;
+      return out;
+    }
+    function kieValidate(doc, raw, value, path = 'input') {
+      if (raw === false) throw new Error('KIE: ' + path + ' is not allowed');
+      const s = kieSchema(doc, raw) || {};
+      if (s === true) return;
+      if (s.oneOf || s.anyOf) {
+        const errors = [];
+        let matches = 0;
+        for (const branch of s.oneOf || s.anyOf) {
+          try { kieValidate(doc, branch, value, path); matches++; } catch (e) { errors.push(e.message); }
+        }
+        if (!matches || (s.oneOf && matches !== 1)) throw new Error('KIE: ' + path + ' schema alternatives: ' + (errors.join('; ') || 'ambiguous oneOf'));
+      }
+      const types = Array.isArray(s.type) ? s.type : s.type ? [s.type] : [];
+      const isType = (t) => t === 'null' ? value === null : t === 'array' ? Array.isArray(value) : t === 'object' ? !!value && typeof value === 'object' && !Array.isArray(value) : t === 'integer' ? Number.isInteger(value) : t === 'number' ? typeof value === 'number' && Number.isFinite(value) : typeof value === t;
+      if (types.length && !types.some(isType)) throw new Error('KIE: ' + path + ' must be ' + types.join('/'));
+      if (s.enum && !s.enum.some((v) => JSON.stringify(v) === JSON.stringify(value))) throw new Error('KIE: ' + path + ' must be one of ' + JSON.stringify(s.enum));
+      if ('const' in s && JSON.stringify(s.const) !== JSON.stringify(value)) throw new Error('KIE: ' + path + ' must be ' + JSON.stringify(s.const));
+      if (typeof value === 'string' && ((s.minLength != null && value.length < s.minLength) || (s.maxLength != null && value.length > s.maxLength) || (s.pattern && !new RegExp(s.pattern).test(value)))) throw new Error('KIE: ' + path + ' has invalid length/format');
+      if (typeof value === 'number' && ((s.minimum != null && value < s.minimum) || (s.maximum != null && value > s.maximum))) throw new Error('KIE: ' + path + ' is out of range');
+      if (Array.isArray(value)) {
+        if ((s.minItems != null && value.length < s.minItems) || (s.maxItems != null && value.length > s.maxItems)) throw new Error('KIE: ' + path + ' has invalid item count');
+        if (s.items != null) value.forEach((v, i) => kieValidate(doc, s.items, v, path + '[' + i + ']'));
+      } else if (value && typeof value === 'object') {
+        for (const k of s.required || []) if (!(k in value)) throw new Error('KIE: required ' + path + '.' + k + '; configure extra JSON {"input":{...}}');
+        for (const [k, v] of Object.entries(value)) {
+          if (s.properties && Object.hasOwn(s.properties, k)) kieValidate(doc, s.properties[k], v, path + '.' + k);
+          else if (s.additionalProperties === false) throw new Error('KIE: unknown ' + path + '.' + k);
+          else if (s.additionalProperties && typeof s.additionalProperties === 'object') kieValidate(doc, s.additionalProperties, v, path + '.' + k);
+        }
+      }
+    }
+    function kieInput(doc, raw, prompt, urls, o, extra) {
+      const root = kieSchema(doc, raw);
+      if (!root || typeof root !== 'object') throw new Error('KIE: input schema is missing');
+      const variants = root.oneOf || root.anyOf;
+      if (variants) {
+        const errors = [];
+        for (const branch of variants) {
+          try {
+            const { oneOf, anyOf, ...common } = root;
+            const value = kieInput(doc, { allOf: [common, branch] }, prompt, urls, o, extra);
+            kieValidate(doc, root, value);
+            return value;
+          } catch (e) { errors.push(e.message); }
+        }
+        throw new Error(errors.join('; '));
+      }
+      const props = root.properties || {};
+      const input = { ...extra };
+      const put = (k, v) => {
+        if (!Object.hasOwn(props, k) || Object.hasOwn(input, k) || v == null || v === '') return;
+        const field = kieSchema(doc, props[k]);
+        const value = field.type === 'string' && typeof v === 'number' ? String(v) : v;
+        input[k] = value;
+      };
+      for (const [k, field] of Object.entries(props)) {
+        const resolved = kieSchema(doc, field);
+        if (resolved && resolved.default !== undefined && !Object.hasOwn(input, k)) input[k] = structuredClone(resolved.default);
+      }
+      // Node controls take precedence over schema defaults, but never over explicit extra input.
+      for (const [k, v] of Object.entries({ prompt, aspect_ratio: o.ratio, duration: o.duration, resolution: o.resolution })) {
+        if (!Object.hasOwn(extra, k)) { delete input[k]; put(k, v); if (!Object.hasOwn(input, k)) { const f = kieSchema(doc, props[k]); if (f && f.default !== undefined) input[k] = structuredClone(f.default); } }
+      }
+      if (urls.length) {
+        const key = ['image_urls', 'image_url', 'input_image', 'image', 'first_frame_image', 'image_input', 'input_urls'].find((k) => Object.hasOwn(props, k));
+        if (!key) throw new Error('KIE: model has no supported image URL field; select an image-to-video model or remove references');
+        if (Object.hasOwn(extra, key)) throw new Error('KIE: extra input.' + key + ' conflicts with connected images');
+        const field = kieSchema(doc, props[key]);
+        if (field.type !== 'array' && urls.length > 1) throw new Error('KIE: input.' + key + ' accepts one image only');
+        input[key] = field.type === 'array' ? urls : urls[0];
+      }
+      kieValidate(doc, root, input);
+      return input;
+    }
+    async function kieUploadImage(s, ref) {
+      const blob = ref && ref.blob ? ref.blob : ref;
+      if (typeof blob === 'string' && /^https:\/\//i.test(blob)) return blob;
+      if (!(blob instanceof Blob)) throw new Error('KIE: expected an image Blob or public HTTPS URL');
+      if (!['image/png', 'image/jpeg', 'image/webp'].includes(blob.type)) throw new Error('KIE: upload requires PNG, JPEG or WebP');
+      const fd = new FormData();
+      fd.append('file', blob, 'frame.' + (blob.type === 'image/png' ? 'png' : blob.type === 'image/webp' ? 'webp' : 'jpg'));
+      fd.append('uploadPath', 'images/dsh-infinite-canvas');
+      const serialized = new Response(fd);
+      const r = await fetchViaProxy('https://kieai.redpandaai.co/api/file-stream-upload', {
+        headers: { Authorization: 'Bearer ' + String(s.apiKey).trim() },
+        bodyRaw: arrayBufferToBase64(await serialized.arrayBuffer()), bodyContentType: serialized.headers.get('content-type'), label: 'KIE upload',
+      });
+      if (!r.ok) throw new Error('KIE upload HTTP ' + r.status);
+      let j;
+      try { j = JSON.parse(r.text); } catch { throw new Error('KIE upload: invalid JSON'); }
+      if (j.code !== 200 || j.success !== true || !/^https:\/\//.test(String(j.data && j.data.downloadUrl))) throw new Error('KIE upload: ' + (j.msg || 'missing downloadUrl'));
+      return j.data.downloadUrl;
+    }
+    function kieResult(data) {
+      if (!data || typeof data.state !== 'string') throw new Error('KIE: invalid task response');
+      if (data.state === 'fail') throw new Error('KIE task failed ' + (data.failCode || '') + ': ' + (data.failMsg || 'Unknown error'));
+      if (data.state !== 'success') return '';
+      let result = data.response;
+      if (!result && data.resultJson) {
+        try { result = JSON.parse(data.resultJson); } catch { throw new Error('KIE: invalid resultJson'); }
+      }
+      const url = result && result.resultUrls && result.resultUrls[0];
+      if (typeof url !== 'string' || !/^https:\/\//.test(url)) throw new Error('KIE: task succeeded without a result URL');
+      return url;
+    }
+    async function kieMediaTask(prompt, refs, s, o, kind) {
+      const catalog = await kieCatalog(s, kind);
+      if (!catalog.some((m) => m.model === s.model)) throw new Error('KIE: model is not in the current ' + kind + ' catalog: ' + s.model);
+      const schema = await kieDiscover(s, '/api/v1/models/' + s.model + '/schema');
+      const doc = schema && schema.openapi;
+      const operation = doc && doc.paths && doc.paths['/api/v1/jobs/createTask'] && doc.paths['/api/v1/jobs/createTask'].post;
+      if (!operation) throw new Error('KIE: model schema unavailable or not a createTask model');
+      const request = kieSchema(doc, operation.requestBody);
+      const bodySchema = request && request.content && request.content['application/json'] && request.content['application/json'].schema;
+      const root = kieSchema(doc, bodySchema);
+      if (!root || !root.properties || !root.properties.input) throw new Error('KIE: request schema has no input');
+      const extra = mergeKieExtra({}, parseExtraParams(s.extra) || {});
+      if (Object.keys(extra).some((k) => k !== 'input' && k !== 'callBackUrl')) throw new Error('KIE: extra parameters must use {"input":{...}} (optional callBackUrl)');
+      if (genAborted()) throw new Error(T('stoppedNote'));
+      // Validate before uploading user media or creating a billable task.
+      const controls = { ...o, resolution: kind === 'image' ? s.size || o.size : o.resolution };
+      const preview = { model: s.model, input: kieInput(doc, root.properties.input, prompt, refs.map(() => 'https://example.com/frame.png'), controls, extra.input || {}), ...(extra.callBackUrl ? { callBackUrl: extra.callBackUrl } : {}) };
+      kieValidate(doc, root, preview, 'request');
+      const credit = await kieRequest(s, '/api/v1/chat/credit');
+      if (typeof credit !== 'number' || credit <= 0) throw new Error('KIE: insufficient credits or invalid balance response');
+      const urls = [];
+      for (const ref of refs) {
+        if (genAborted()) throw new Error(T('stoppedNote'));
+        urls.push(await kieUploadImage(s, ref));
+      }
+      const body = { model: s.model, input: kieInput(doc, root.properties.input, prompt, urls, controls, extra.input || {}), ...(extra.callBackUrl ? { callBackUrl: extra.callBackUrl } : {}) };
+      kieValidate(doc, root, body, 'request');
+      if (genAborted()) throw new Error(T('stoppedNote'));
+      const task = await kieRequest(s, '/api/v1/jobs/createTask', body);
+      if (!task || !task.taskId) throw new Error('KIE: createTask returned no taskId');
+      const query = '/api/v1/jobs/recordInfo?taskId=' + encodeURIComponent(task.taskId);
+      if (o.onTask) o.onTask(task.taskId, kieBase(s) + query);
+      const deadline = Date.now() + (kind === 'image' ? 10 : 120) * 60 * 1000;
+      let queryRetries = 0;
+      while (Date.now() < deadline) {
+        await sleep(3000);
+        if (genAborted()) throw new Error(T('stoppedNote'));
+        let record;
+        try { record = await kieRequest(s, query); }
+        catch (e) {
+          if (queryRetries++ >= 4 || !(e.status === 429 || e.status >= 500)) throw new Error('KIE task ' + task.taskId + ': ' + e.message);
+          console.info('[IC] KIE query retry for task ' + task.taskId + ': ' + e.message);
+          continue;
+        }
+        queryRetries = 0;
+        const url = kieResult(record);
+        if (url) {
+          try { return await downloadVideo(url, {}); }
+          catch (e) {
+            if (!retryableDownloadError(e)) throw e;
+            console.info('[IC] KIE refreshing download URL for task ' + task.taskId + ': ' + e.message);
+            const direct = await kieRequest(s, '/api/v1/common/download-url', { url });
+            if (typeof direct !== 'string' || !/^https:\/\//.test(direct)) throw new Error('KIE: invalid direct download URL');
+            return await downloadVideo(direct, {});
+          }
+        }
+      }
+      throw new Error('KIE: timed out; query saved taskId ' + task.taskId + ' before resubmitting to avoid duplicate charges');
     }
     /** 已知网关的厂商路径前缀：网关把各厂商 API 挂在各自前缀下（如 RelayRouter 的百炼 = /alibailian）。
      *  不在表里的网关，把前缀直接写进 Base URL 即可（如 https://gw.example.com/alibailian）。 */
@@ -6675,6 +6925,7 @@ function queueThumb(assetId) {
       // 曾经按模型名猜（wan3.0-video → 误走 DashScope 官方格式），中转站收不到认识的字段直接 502。
       if (s.vendor) return s.vendor;
       const url = String(s.url || '').toLowerCase();
+      try { if (new URL(url).hostname === 'api.kie.ai') return 'kie'; } catch { /* Other vendor routing handles invalid URLs. */ }
       // URL 特征兜底：URL 也是用户显式配置的一部分（旧配置 vendor 字段为空时走这里，
       // 设置卡片渲染时会按此回填 vendor，之后恒走显式值）。
       if (url.includes('dashscope')) return 'wan';
@@ -6712,6 +6963,11 @@ function queueThumb(assetId) {
       throw new Error(label + '超过 2 小时未返回（任务 id 已保存在节点上，可凭 id 回查结果）');
     }
     const VIDEO_VENDOR_RUNNERS = {
+      async kie(prompt, frameBlob, s, o) {
+        if ((!o.hardFrame && (o.refs || []).length) || (o.audioRefs || []).length) throw new Error('KIE: connect a first-frame image only; entity/audio references are not mapped by this adapter');
+        if (!frameBlob) throw new Error('KIE: image-to-video requires a first-frame image');
+        return await kieMediaTask(prompt, [frameBlob], s, o, 'video');
+      },
       // —— 快手可灵 Kling：JWT(AK:SK) 鉴权，i2v/t2v，轮询 task_id ——
       async kling(prompt, frameBlob, s, o) {
         const [ak, sk] = String(s.apiKey || '').split(':');
@@ -7184,6 +7440,7 @@ function queueThumb(assetId) {
     /** 各视频厂商的参考素材上限（与各 runner 内部的截断口径一致）：
      *  超出上限会被截断——必须显式告警（o.warn → 节点 genWarn），绝不静默丢素材。 */
     const VIDEO_REF_CAPS = {
+      kie: { img: 0 },
       wan: { img: 10 },
       // 三宝：按最保守通用模型（hailuo/SD2.0 系 9 图 3 音频；wan/kling 系 10 图、SD2.5 系 30 图，见厂商 note）
       sanbao: { img: 9, audio: 3 },
@@ -7202,7 +7459,9 @@ function queueThumb(assetId) {
       if (nodeExtra) {
         try {
           const baseExtra = String(s.extra || '').trim();
-          s = { ...s, extra: JSON.stringify({ ...(baseExtra ? JSON.parse(baseExtra) : {}), ...JSON.parse(nodeExtra) }) };
+          const providerExtra = parseExtraParams(baseExtra) || {};
+          const localExtra = parseExtraParams(nodeExtra);
+          s = { ...s, extra: JSON.stringify(detectVideoVendor(s) === 'kie' ? mergeKieExtra(providerExtra, localExtra) : { ...providerExtra, ...localExtra }) };
         } catch (e) { throw new Error('节点扩展参数需为 JSON 对象：' + ((e && e.message) || e)); }
       }
       // 衔接模式：auto=尾帧降级为参考图（保留实体参考图）；hard=硬首帧（放弃参考图，画面绝对承接）；
@@ -12056,6 +12315,7 @@ function queueThumb(assetId) {
         const settings = loadSettings();
         const cfg = resolveImageModelCfg(settings, nodeImageModelRef(n));
         if (!cfg) { toast(T('errNoImageModel')); return; }
+        if (cfg.mode === 'kie') { toast(T('kieMaskUnsupported')); return; }
         setRunning(true); setErr(null);
         try {
           const mk = maskRef.current;
@@ -18894,6 +19154,33 @@ const DIRECTOR_KEY_HELP = [
         style: { flex: 'none', width: 14, height: 14, lineHeight: '13px', textAlign: 'center', fontSize: 10, borderRadius: '50%', border: '1px solid var(--dsw-alias-border-secondary, #777)', color: 'var(--dsw-alias-label-secondary, #999)', cursor: 'help', userSelect: 'none', opacity: 0.85 },
       }, 'i');
     }
+    function KieModelPicker({ provider, kind, onPick }) {
+      const [models, setModels] = useState([]);
+      const [busy, setBusy] = useState(false);
+      const [error, setError] = useState('');
+      useEffect(() => { setModels([]); setError(''); }, [provider.apiKey, provider.baseUrl, provider.url, kind]);
+      const load = async () => {
+        setBusy(true);
+        setError('');
+        setModels([]);
+        try {
+          const found = await kieCatalog(provider, kind);
+          setModels(found);
+          if (!found.length) setError(T('kieNoModels'));
+        }
+        catch (e) { setError(String(e.message || e)); }
+        finally { setBusy(false); }
+      };
+      return h('div', { className: 'dshic-field' },
+        h('button', { type: 'button', className: 'dshic-mini', disabled: busy, onClick: load, onPointerDown: (e) => e.stopPropagation() }, T(busy ? 'kieLoading' : 'kieLoadModels')),
+        error ? h('div', { className: 'dshic-hint', role: 'alert' }, error) : null,
+        models.length ? h('select', {
+          className: 'dshic-select', value: '', onPointerDown: (e) => e.stopPropagation(),
+          onChange: (e) => { if (e.target.value) onPick(e.target.value); },
+        }, h('option', { value: '' }, T('kiePickModel')), models.map((m) => h('option', { key: m.model, value: m.model, title: m.pricingDesc || '' }, m.model + (m.pricingDesc ? ' — ' + m.pricingDesc : '')))) : null,
+        h('div', { className: 'dshic-hint' }, T('kieExtraHint')),
+      );
+    }
     /** 图片/视频模型配置（供应商 + 模型两级）：一个供应商配一次 URL/Key，下面挂多个模型；
      *  ★星标模型 = 节点未指定时的默认路由。 */
     function ModelProviderEditor({ kind }) {
@@ -18959,7 +19246,7 @@ const DIRECTOR_KEY_HELP = [
                 h('select', {
                   className: 'dshic-select', value: detectVideoVendor(p),
                   onPointerDown: (e) => e.stopPropagation(),
-                  onChange: (e) => { const v = e.target.value; const vd = VIDEO_VENDORS[v]; patchProvider(p.id, 'vendor', v); if (vd && vd.base && !p[urlKey]) patchProvider(p.id, urlKey, vd.base); },
+                  onChange: (e) => { const v = e.target.value; const vd = VIDEO_VENDORS[v]; mutate((d) => { const target = d[listKey].find((x) => x.id === p.id); target.vendor = v; if (vd && vd.base && !target[urlKey]) target[urlKey] = vd.base; }); },
                 },
                   Object.entries(VIDEO_VENDORS).map(([id, vd]) => h('option', { key: id, value: id }, vd.label))),
               ) : null,
@@ -18967,13 +19254,14 @@ const DIRECTOR_KEY_HELP = [
               h(Field, { key: 'k', label: T('apiKey'), value: p.apiKey || '', onChange: (v) => patchProvider(p.id, 'apiKey', v), placeholder: kind === 'video' ? ((VIDEO_VENDORS[detectVideoVendor(p)] || {}).keyPh || 'sk-…') : 'sk-…', password: true }),
               kind === 'image' ? [
                 h(Field, { key: 'size', label: T('imgSizeOverride'), value: p.size || '', onChange: (v) => patchProvider(p.id, 'size', v), placeholder: T('imgSizePlaceholder') }),
-                h(Field, { key: 'rf', label: T('imgResponseFormat'), value: p.responseFormat || '', onChange: (v) => patchProvider(p.id, 'responseFormat', v), placeholder: 'b64_json / url（留空=API 默认）' }),
+                p.mode !== 'kie' ? h(Field, { key: 'rf', label: T('imgResponseFormat'), value: p.responseFormat || '', onChange: (v) => patchProvider(p.id, 'responseFormat', v), placeholder: 'b64_json / url（留空=API 默认）' }) : null,
                 h('div', { key: 'mode', className: 'dshic-field' },
                   h('span', { className: 'dshic-field-label' }, T('imgMode')),
-                  h('select', { className: 'dshic-select', value: p.mode || 'generations', onChange: (e) => patchProvider(p.id, 'mode', e.target.value), onPointerDown: (e) => e.stopPropagation() },
+                  h('select', { className: 'dshic-select', value: p.mode || 'generations', onChange: (e) => { const mode = e.target.value; mutate((d) => { const target = d[listKey].find((x) => x.id === p.id); target.mode = mode; if (mode === 'kie' && !target.baseUrl) target.baseUrl = 'https://api.kie.ai'; }); }, onPointerDown: (e) => e.stopPropagation() },
                     h('option', { value: 'generations' }, T('modeGenerations')),
                     h('option', { value: 'edits' }, T('modeEdits')),
                     h('option', { value: 'compshare' }, T('modeCompshare')),
+                    h('option', { value: 'kie' }, T('modeKie')),
                     h('option', { value: 'sanbao' }, T('modeSanbao')))),
               ] : [
                 (detectVideoVendor(p) === 'openai' || detectVideoVendor(p) === 'seedance') ? h(Field, { key: 'of', label: T('vidOutFormat'), value: p.outputFormat || '', onChange: (v) => patchProvider(p.id, 'outputFormat', v), placeholder: 'mp4（留空不发送）' }) : null,
@@ -18982,8 +19270,12 @@ const DIRECTOR_KEY_HELP = [
                   h('span', {}, T('vidAudioOpt'))) : null,
               ],
               (kind === 'image' || kind === 'video') ? [
-                h(Field, { key: 'extra', label: T('cfgExtra'), value: p.extra || '', onChange: (v) => patchProvider(p.id, 'extra', v), placeholder: '{"watermark":false,"prompt_extend":false}', tip: T('cfgExtraHint') }),
+                h(Field, { key: 'extra', label: T('cfgExtra'), value: p.extra || '', onChange: (v) => patchProvider(p.id, 'extra', v), placeholder: (kind === 'image' ? p.mode === 'kie' : detectVideoVendor(p) === 'kie') ? '{"input":{}}' : '{"watermark":false,"prompt_extend":false}', tip: T((kind === 'image' ? p.mode === 'kie' : detectVideoVendor(p) === 'kie') ? 'kieExtraHint' : 'cfgExtraHint') }),
               ] : null,
+              (kind === 'image' ? p.mode === 'kie' : detectVideoVendor(p) === 'kie') ? h(KieModelPicker, {
+                key: 'kie-' + p.id + '-' + p[urlKey], provider: p, kind,
+                onPick: (model) => mutate((d) => { const target = d[listKey].find((x) => x.id === p.id); if (!(target.models || []).some((m) => m.model === model)) target.models = (target.models || []).concat([{ id: uid('m'), model }]); }),
+              }) : null,
               h('div', { className: 'dshic-row', style: { marginTop: 4 } },
                 h('span', { className: 'dshic-field-label', style: { flex: 1, minWidth: 0 } }, T('modelsLabel')),
                 h('button', { type: 'button', className: 'dshic-mini', onPointerDown: (e) => e.stopPropagation(), onClick: () => addModel(p.id) }, Ic('plus', 11), T('addModel')),
@@ -19109,6 +19401,7 @@ const DIRECTOR_KEY_HELP = [
                     },
                       h('option', { value: 'generations' }, T('modeGenerations')),
                       h('option', { value: 'edits' }, T('modeEdits')),
+                      h('option', { value: 'kie' }, T('modeKie')),
                       h('option', { value: 'sanbao' }, T('modeSanbao'))))
                 : null,
               kind === 'video'
@@ -21161,4 +21454,3 @@ const DIRECTOR_KEY_HELP = [
     };
   },
 });
-
